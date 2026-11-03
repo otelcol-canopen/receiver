@@ -1,0 +1,300 @@
+package canopenreceiver
+
+import (
+	"context"
+	"fmt"
+	"sync"
+
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/receiver"
+	"go.uber.org/zap"
+
+	"github.com/otelcol-canopen/receiver/receiver/canopenreceiver/internal/cantransport"
+	"github.com/otelcol-canopen/receiver/receiver/canopenreceiver/internal/emit"
+	"github.com/otelcol-canopen/receiver/receiver/canopenreceiver/internal/sniffer"
+)
+
+// canopenReceiver implements receiver.Metrics and receiver.Logs by sharing a
+// single underlying CAN connection and dispatch loop. The factory hands out
+// the same instance to both signal consumers so there is exactly one
+// connection to the bus regardless of which signals are enabled.
+type canopenReceiver struct {
+	cfg      *Config
+	settings receiver.Settings
+	dialer   cantransport.Dialer
+
+	metricsConsumer consumer.Metrics
+	logsConsumer    consumer.Logs
+
+	sniff *sniffer.Sniffer
+
+	metricsBuilder *emit.MetricsBuilder
+	logsBuilder    *emit.LogsBuilder
+	buildersMu     sync.Mutex
+
+	conn      cantransport.Conn
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	sendMu    sync.Mutex
+	poller    *sdoPoller
+	rawPoller *rawTransactionPoller
+
+	startOnce    sync.Once
+	shutdownOnce sync.Once
+	startErr     error
+}
+
+func newCanopenReceiver(cfg *Config, set receiver.Settings, dialer cantransport.Dialer) *canopenReceiver {
+	r := &canopenReceiver{
+		cfg:            cfg,
+		settings:       set,
+		dialer:         dialer,
+		metricsBuilder: emit.NewMetricsBuilder(),
+		logsBuilder:    emit.NewLogsBuilder(),
+	}
+	r.sniff = sniffer.New(buildSnifferConfig(cfg))
+	return r
+}
+
+func buildSnifferConfig(cfg *Config) sniffer.Config {
+	sc := sniffer.Config{
+		InterfaceName:       cfg.Interface,
+		PDOs:                make(map[uint32]sniffer.PDODef),
+		HeartbeatEmitMetric: cfg.Heartbeat.Metrics,
+		HeartbeatEmitLog:    cfg.Heartbeat.Logs,
+		EMCYEmitMetric:      cfg.EMCY.Metrics,
+		EMCYEmitLog:         cfg.EMCY.Logs,
+		SDOObjects:          make([]sniffer.SDOObjectDef, 0, len(cfg.SDO.Sniff.Objects)+len(cfg.SDO.Poll.Objects)),
+		SDOChannels:         make([]sniffer.SDOChannel, 0, len(cfg.SDO.Sniff.Channels)),
+		RawEmitMetric:       cfg.Raw.Sniff.Metrics,
+		RawEmitLog:          cfg.Raw.Sniff.Logs,
+		RawCobIDs:           make(map[uint32]struct{}, len(cfg.Raw.Sniff.CobIDs)),
+		RawMessages:         make(map[uint32][]sniffer.RawMessageDef),
+	}
+	for _, channel := range cfg.SDO.Sniff.Channels {
+		sc.SDOChannels = append(sc.SDOChannels, sniffer.SDOChannel{
+			NodeID: channel.NodeID, ClientToServerCobID: channel.ClientToServerCobID,
+			ServerToClientCobID: channel.ServerToClientCobID,
+		})
+	}
+	for _, object := range cfg.SDO.Sniff.Objects {
+		sc.SDOObjects = append(sc.SDOObjects, sniffer.SDOObjectDef{
+			NodeID: object.NodeID, Index: object.Index, SubIndex: object.SubIndex,
+			Fields: buildSnifferFields(object.Fields),
+		})
+	}
+	for _, object := range cfg.SDO.Poll.Objects {
+		sc.SDOObjects = append(sc.SDOObjects, sniffer.SDOObjectDef{
+			NodeID: object.NodeID, Index: object.Index, SubIndex: object.SubIndex,
+			Fields: buildSnifferFields(object.Fields),
+		})
+	}
+	for _, id := range cfg.Raw.Sniff.CobIDs {
+		sc.RawCobIDs[id] = struct{}{}
+	}
+	for _, msg := range cfg.Raw.Sniff.Messages {
+		def := sniffer.RawMessageDef{Name: msg.Name, Fields: buildSnifferFields(msg.Fields)}
+		for _, m := range msg.Match {
+			def.Match = append(def.Match, sniffer.RawMatch{ByteOffset: m.ByteOffset, Value: m.Value})
+		}
+		sc.RawMessages[msg.CobID] = append(sc.RawMessages[msg.CobID], def)
+		sc.RawCobIDs[msg.CobID] = struct{}{}
+	}
+	for _, pdo := range cfg.PDO {
+		sc.PDOs[pdo.CobID] = sniffer.PDODef{Name: pdo.Name, CobID: pdo.CobID, Fields: buildSnifferFields(pdo.Fields)}
+	}
+	return sc
+}
+
+// buildSnifferFields converts a list of FieldConfig into the sniffer
+// package's independent Field type.
+func buildSnifferFields(fields []FieldConfig) []sniffer.Field {
+	out := make([]sniffer.Field, 0, len(fields))
+	for _, field := range fields {
+		out = append(out, sniffer.Field{
+			Name:       field.Name,
+			BitOffset:  field.BitOffset,
+			Type:       field.Type,
+			ByteLen:    field.ByteLen,
+			Scale:      field.Scale,
+			Offset:     field.Offset,
+			Unit:       field.Unit,
+			EmitMetric: field.Metrics,
+			EmitLog:    field.Logs,
+			MetricSum:  field.MetricType == MetricSum,
+			Attributes: field.Attributes,
+		})
+	}
+	return out
+}
+
+func (r *canopenReceiver) Start(ctx context.Context, _ component.Host) error {
+	r.startOnce.Do(func() {
+		r.startErr = r.doStart(ctx)
+	})
+	return r.startErr
+}
+
+func (r *canopenReceiver) doStart(ctx context.Context) error {
+	dialCtx, cancel := context.WithTimeout(ctx, cantransport.DialTimeout)
+	defer cancel()
+	conn, err := r.dialer.Dial(dialCtx, r.cfg.Interface)
+	if err != nil {
+		return fmt.Errorf("canopenreceiver: failed to open interface %q: %w", r.cfg.Interface, err)
+	}
+	r.conn = conn
+
+	runCtx, runCancel := context.WithCancel(context.Background())
+	r.cancel = runCancel
+
+	r.wg.Add(1)
+	go r.dispatchLoop(runCtx)
+	if len(r.cfg.SDO.Poll.Objects) > 0 {
+		r.poller = newSDOPoller(r, runCtx)
+		r.wg.Add(1)
+		go r.poller.run()
+	}
+	if len(r.cfg.Raw.Transactions) > 0 {
+		r.rawPoller = newRawTransactionPoller(r, runCtx)
+		r.wg.Add(1)
+		go r.rawPoller.run()
+	}
+
+	return nil
+}
+
+func (r *canopenReceiver) Shutdown(ctx context.Context) error {
+	var shutdownErr error
+	r.shutdownOnce.Do(func() {
+		shutdownErr = r.doShutdown(ctx)
+	})
+	return shutdownErr
+}
+
+func (r *canopenReceiver) doShutdown(ctx context.Context) error {
+	if r.cancel != nil {
+		r.cancel()
+	}
+	if r.conn != nil {
+		_ = r.conn.Close()
+	}
+	done := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	// Flush anything remaining so shutdown doesn't silently drop pending data.
+	r.flushMetrics(ctx)
+	r.flushLogs(ctx)
+	return nil
+}
+
+// dispatchLoop is the single reader of the shared Conn, routing every frame
+// to the sniffer.
+func (r *canopenReceiver) dispatchLoop(ctx context.Context) {
+	defer r.wg.Done()
+	logger := r.settings.Logger
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		recvCtx, cancel := context.WithTimeout(ctx, r.cfg.ReadTimeout)
+		f, err := r.conn.Recv(recvCtx)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if err == context.DeadlineExceeded {
+				continue
+			}
+			if err == cantransport.ErrClosed {
+				return
+			}
+			logger.Warn("canopen: frame receive error", zap.Error(err))
+			continue
+		}
+
+		if r.poller != nil {
+			r.poller.handleFrame(f)
+		}
+		transactionResponse := false
+		if r.rawPoller != nil {
+			transactionResponse = r.rawPoller.handleFrame(f)
+		}
+		if !transactionResponse {
+			r.buildersMu.Lock()
+			r.sniff.HandleFrame(f, r.metricsIfEnabled(), r.logsIfEnabled())
+			r.buildersMu.Unlock()
+		}
+		r.flushMetrics(ctx)
+		r.flushLogs(ctx)
+	}
+}
+
+func (r *canopenReceiver) sendFrame(ctx context.Context, f cantransport.Frame) error {
+	r.sendMu.Lock()
+	defer r.sendMu.Unlock()
+	return r.conn.Send(ctx, f)
+}
+
+func (r *canopenReceiver) sendPollFrame(ctx context.Context, f cantransport.Frame) error {
+	r.buildersMu.Lock()
+	r.sniff.HandleFrame(f, r.metricsIfEnabled(), r.logsIfEnabled())
+	r.buildersMu.Unlock()
+	return r.sendFrame(ctx, f)
+}
+
+func (r *canopenReceiver) metricsIfEnabled() *emit.MetricsBuilder {
+	if r.cfg.Metrics.Enabled {
+		return r.metricsBuilder
+	}
+	return nil
+}
+
+func (r *canopenReceiver) logsIfEnabled() *emit.LogsBuilder {
+	if r.cfg.Logs.Enabled {
+		return r.logsBuilder
+	}
+	return nil
+}
+
+func (r *canopenReceiver) flushMetrics(ctx context.Context) {
+	if r.metricsConsumer == nil {
+		return
+	}
+	r.buildersMu.Lock()
+	if r.metricsBuilder.Empty() {
+		r.buildersMu.Unlock()
+		return
+	}
+	md := r.metricsBuilder.Emit()
+	r.buildersMu.Unlock()
+	if err := r.metricsConsumer.ConsumeMetrics(ctx, md); err != nil {
+		r.settings.Logger.Error("canopen: failed to consume metrics", zap.Error(err))
+	}
+}
+
+func (r *canopenReceiver) flushLogs(ctx context.Context) {
+	if r.logsConsumer == nil {
+		return
+	}
+	r.buildersMu.Lock()
+	if r.logsBuilder.Empty() {
+		r.buildersMu.Unlock()
+		return
+	}
+	ld := r.logsBuilder.Emit()
+	r.buildersMu.Unlock()
+	if err := r.logsConsumer.ConsumeLogs(ctx, ld); err != nil {
+		r.settings.Logger.Error("canopen: failed to consume logs", zap.Error(err))
+	}
+}

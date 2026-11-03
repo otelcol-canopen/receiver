@@ -1,0 +1,40 @@
+# Configuration for the OpenTelemetry Collector Builder (ocb):
+# https://github.com/open-telemetry/opentelemetry-collector/tree/main/cmd/builder
+#
+# Produces a single "otelcol-canopen" binary containing the CANopen
+# receiver (passive decoding and active SDO polling) plus a practical starter set
+# of core/contrib processors and exporters, so the receiver can be combined
+# with normal Collector pipeline components on a real device today (see
+# config/example-collector.yaml).
+#
+# Build with: make build-device   (wraps `ocb --config=builder-config.yaml`)
+dist:
+  name: otelcol-canopen
+  description: OpenTelemetry Collector distribution with the CANopen receiver
+  output_path: ./dist
+  module: github.com/otelcol-canopen/receiver/cmd/otelcol-canopen
+  version: 0.1.0
+
+receivers:
+  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.159.0
+  - gomod: github.com/otelcol-canopen/receiver/receiver/canopenreceiver v0.1.0
+
+processors:
+  - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.159.0
+  - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.159.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor v0.159.0
+
+exporters:
+  - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.159.0
+  - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.159.0
+  - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.159.0
+
+extensions:
+  - gomod: go.opentelemetry.io/collector/extension/zpagesextension v0.159.0
+
+# While the receiver hasn't been published/tagged yet, point ocb at the
+# local module so `make build-device` works from a checkout. Paths are
+# relative to output_path (./dist), so we go up one level back to the repo
+# root and into receiver/canopenreceiver.
+replaces:
+  - github.com/otelcol-canopen/receiver/receiver/canopenreceiver => ../receiver/canopenreceiver
