@@ -265,14 +265,44 @@ Used by `pdo[].fields[]`, `sdo.sniff.objects[].fields[]`,
 |---|---|---|
 | `name` | string | Metric name (metric emission), and the key this field's value is stored under in the structured log body map (log emission). |
 | `bit_offset` | int | 0-based, LSB-first bit offset into the payload. |
-| `type` | string | One of `bool`, `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bytes`, `visible_string`. |
-| `byte_len` | int | Required for `bytes`/`visible_string`; ignored otherwise. |
+| `type` | string | One of `bool`, `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `uint_auto`, `float32`, `float64`, `bytes`, `visible_string`. |
+| `byte_len` | int | For `bytes` and `visible_string`, omit it or set it to `0` to decode the remaining payload from `bit_offset`. A positive value retains fixed-length decoding. Omit for `uint_auto`; ignored for other numeric types. |
 | `scale` / `offset` | float | Linear transform applied as `value*scale + offset` (scale defaults to 1). Not applicable to `bytes`/`visible_string`. |
 | `unit` | string | Attached to the emitted metric. |
 | `metrics` | bool | Emit this field as a metric. Requires top-level `metrics.enabled: true`. Not supported for `bytes`/`visible_string` (metrics can't represent them) - use `logs` instead. |
 | `logs` | bool | Include this field's value in the group's structured log body map. Requires top-level `logs.enabled: true`. |
 | `metric_type` | `gauge`\|`sum` | Metric point type when emitting metrics (default `gauge`). |
 | `attributes` | map[string]string | Extra static attributes attached to every emitted data point/log record for this field. Log-side attributes from every field in the same group are merged into one record's `Attributes` (metadata) - not the body. |
+
+For variable-length `bytes` or `visible_string` fields, omit `byte_len`. This
+reads the remaining payload, including any padding or other fields; use an
+explicit length when the field does not occupy the remainder. SDO fields use
+the completed transfer payload; PDO and raw fields use the received frame
+payload.
+
+`uint_auto` decodes the remaining payload as a little-endian unsigned integer
+of 1, 2, 4, or 8 bytes, starting at a byte-aligned `bit_offset`. Values above
+2^53 are rejected because numeric telemetry uses float64. An expedited
+SDO with no indicated size cannot be decoded as `uint_auto`; invalid lengths,
+values, unknown expedited sizes, and segmented transfers whose indicated size
+does not match the assembled payload produce a warning instead of a value.
+For raw and PDO frames, the configured field must occupy the remaining frame
+payload, including any padding.
+
+For example:
+
+```yaml
+sdo:
+  sniff:
+    objects:
+      - node_id: 6
+        index: 0x100A
+        sub_index: 0
+        fields:
+          - name: device.software_version
+            type: visible_string
+            logs: true
+```
 
 ### Log record shape
 

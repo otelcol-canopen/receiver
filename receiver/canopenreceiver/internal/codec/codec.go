@@ -23,6 +23,7 @@ const (
 	Uint16        DataType = "uint16"
 	Uint32        DataType = "uint32"
 	Uint64        DataType = "uint64"
+	UintAuto      DataType = "uint_auto"
 	Float32       DataType = "float32"
 	Float64       DataType = "float64"
 	Bytes         DataType = "bytes"
@@ -30,7 +31,7 @@ const (
 )
 
 // BitWidth returns the number of bits occupied by the given data type, or 0
-// for variable-width types (Bytes, VisibleString).
+// for variable-width types (Bytes, VisibleString, UintAuto).
 func (t DataType) BitWidth() int {
 	switch t {
 	case Bool:
@@ -51,7 +52,7 @@ func (t DataType) BitWidth() int {
 // Valid reports whether t is one of the supported data types.
 func (t DataType) Valid() bool {
 	switch t {
-	case Bool, Int8, Int16, Int32, Int64, Uint8, Uint16, Uint32, Uint64, Float32, Float64, Bytes, VisibleString:
+	case Bool, Int8, Int16, Int32, Int64, Uint8, Uint16, Uint32, Uint64, UintAuto, Float32, Float64, Bytes, VisibleString:
 		return true
 	default:
 		return false
@@ -81,7 +82,7 @@ func (v Value) AsFloat() float64 {
 		return 0
 	case Int8, Int16, Int32, Int64:
 		return float64(v.Int)
-	case Uint8, Uint16, Uint32, Uint64:
+	case Uint8, Uint16, Uint32, Uint64, UintAuto:
 		return float64(v.Uint)
 	case Float32, Float64:
 		return v.Float
@@ -93,22 +94,49 @@ func (v Value) AsFloat() float64 {
 // Decode extracts a value of the given type from data starting at bitOffset
 // (0-based, little-endian bit numbering as used by CANopen PDO mapping: bit 0
 // is the LSB of byte 0). For Bytes/VisibleString, bitOffset must be
-// byte-aligned and byteLen bytes are copied.
+// byte-aligned and byteLen bytes are copied. A zero byteLen reads the
+// remainder of data.
 func Decode(data []byte, dataType DataType, bitOffset int, byteLen int) (Value, error) {
 	if !dataType.Valid() {
 		return Value{}, fmt.Errorf("unsupported data type %q", dataType)
 	}
 
 	switch dataType {
+	case UintAuto:
+		if bitOffset < 0 || bitOffset%8 != 0 {
+			return Value{}, fmt.Errorf("uint_auto requires a non-negative byte-aligned bit_offset, got %d", bitOffset)
+		}
+		start := bitOffset / 8
+		if start > len(data) {
+			return Value{}, fmt.Errorf("byte offset %d out of bounds for payload of length %d", start, len(data))
+		}
+		width := len(data) - start
+		if width != 1 && width != 2 && width != 4 && width != 8 {
+			return Value{}, fmt.Errorf("uint_auto payload length %d is unsupported; expected 1, 2, 4, or 8 bytes", width)
+		}
+		raw, err := extractBits(data, bitOffset, width*8)
+		if err != nil {
+			return Value{}, err
+		}
+		if raw > 1<<53 {
+			return Value{}, fmt.Errorf("uint_auto value %d exceeds exact float64 integer range", raw)
+		}
+		return Value{Type: UintAuto, Uint: raw}, nil
 	case Bytes, VisibleString:
 		if bitOffset%8 != 0 {
 			return Value{}, fmt.Errorf("byte-oriented type %q requires byte-aligned bit_offset, got %d", dataType, bitOffset)
 		}
 		start := bitOffset / 8
-		if byteLen <= 0 {
-			return Value{}, fmt.Errorf("byte_len must be > 0 for type %q", dataType)
+		if byteLen < 0 {
+			return Value{}, fmt.Errorf("byte_len must be >= 0 for type %q", dataType)
 		}
-		if start < 0 || start+byteLen > len(data) {
+		if start < 0 || start > len(data) {
+			return Value{}, fmt.Errorf("byte offset %d out of bounds for payload of length %d", start, len(data))
+		}
+		if byteLen == 0 {
+			byteLen = len(data) - start
+		}
+		if byteLen > len(data)-start {
 			return Value{}, fmt.Errorf("byte range [%d:%d] out of bounds for payload of length %d", start, start+byteLen, len(data))
 		}
 		raw := make([]byte, byteLen)

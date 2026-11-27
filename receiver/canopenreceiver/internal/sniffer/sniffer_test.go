@@ -6,6 +6,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/otelcol-canopen/receiver/receiver/canopenreceiver/internal/cantransport"
 	"github.com/otelcol-canopen/receiver/receiver/canopenreceiver/internal/codec"
@@ -55,6 +58,35 @@ func TestSniffer_PDO(t *testing.T) {
 	assert.Equal(t, "x", lr.Attributes().AsRaw()["axis"])
 	assert.Equal(t, int64(200), lr.Attributes().AsRaw()["priority"])
 	assert.InDelta(t, 100.0, lr.Body().Double(), 0.001)
+}
+
+func TestSniffer_FrameVariableLengthFields(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind codec.DataType
+		want string
+	}{
+		{"string", codec.VisibleString, "v1.2"},
+		{"bytes", codec.Bytes, "76312E32"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			field := Field{Name: "version", BitOffset: 8, Type: tc.kind, EmitLog: true}
+			s := New(Config{
+				InterfaceName: "can0",
+				PDOs:          map[uint32]PDODef{0x181: {Name: "version", CobID: 0x181, Fields: []Field{field}}},
+				RawCobIDs:     map[uint32]struct{}{0x501: {}},
+				RawMessages:   map[uint32][]RawMessageDef{0x501: {{Name: "version", Fields: []Field{field}}}},
+			})
+			for _, id := range []uint32{0x181, 0x501} {
+				logs := emit.NewLogsBuilder()
+				s.HandleFrame(cantransport.Frame{ID: id, Data: []byte{1, 'v', '1', '.', '2'}}, nil, logs)
+				require.False(t, logs.Empty())
+				records := logs.Emit().ResourceLogs().At(0).ScopeLogs().At(0).LogRecords()
+				require.Equal(t, 1, records.Len())
+				assert.Equal(t, tc.want, records.At(0).Body().Str())
+			}
+		})
+	}
 }
 
 func TestSniffer_Heartbeat_StateChangeLogging(t *testing.T) {
@@ -275,6 +307,107 @@ func TestSniffer_SDOReassemblesSegmentedUpload(t *testing.T) {
 	require.False(t, logs.Empty())
 	body := logs.Emit().ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body()
 	assert.Equal(t, "hello world", body.Str())
+}
+
+func TestSniffer_SDOVariableLengthFields(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		kind   codec.DataType
+		frames [][]byte
+		want   string
+	}{
+		{"expedited string", codec.VisibleString, [][]byte{{0x4B, 0x0A, 0x10, 0, 'v', '1', 0, 0}}, "v1"},
+		{"segmented string", codec.VisibleString, [][]byte{
+			{0x41, 0x0A, 0x10, 0, 11, 0, 0, 0},
+			{0x00, 'h', 'e', 'l', 'l', 'o', ' ', 'w'},
+			{0x17, 'o', 'r', 'l', 'd', 0, 0, 0},
+		}, "hello world"},
+		{"expedited bytes", codec.Bytes, [][]byte{{0x4B, 0x0A, 0x10, 0, 'v', '1', 0, 0}}, "7631"},
+		{"segmented bytes", codec.Bytes, [][]byte{
+			{0x41, 0x0A, 0x10, 0, 8, 0, 0, 0},
+			{0x00, 1, 2, 3, 4, 5, 6, 7},
+			{0x1D, 8, 0, 0, 0, 0, 0, 0},
+		}, "0102030405060708"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(Config{
+				InterfaceName: "can0",
+				SDOObjects: []SDOObjectDef{{
+					NodeID: 1, Index: 0x100A,
+					Fields: []Field{{Name: "device.version", Type: tc.kind, EmitLog: true}},
+				}},
+			})
+			logs := emit.NewLogsBuilder()
+			s.HandleFrame(cantransport.Frame{ID: 0x601, Data: []byte{0x40, 0x0A, 0x10, 0, 0, 0, 0, 0}}, nil, logs)
+			for _, frame := range tc.frames {
+				s.HandleFrame(cantransport.Frame{ID: 0x581, Data: frame}, nil, logs)
+			}
+			require.False(t, logs.Empty())
+			records := logs.Emit().ResourceLogs().At(0).ScopeLogs().At(0).LogRecords()
+			require.Equal(t, 1, records.Len())
+			assert.Equal(t, tc.want, records.At(0).Body().Str())
+		})
+	}
+}
+
+func TestSniffer_SDOUintAuto(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		reply   []byte
+		want    float64
+		wantErr string
+	}{
+		{"8-bit", []byte{0x4F, 0x01, 0x20, 0x00, 0x34, 0, 0, 0}, 0x34, ""},
+		{"16-bit", []byte{0x4B, 0x01, 0x20, 0x00, 0x34, 0x12, 0, 0}, 0x1234, ""},
+		{"32-bit", []byte{0x43, 0x01, 0x20, 0x00, 1, 0, 0, 0}, 1, ""},
+		{"unsupported width", []byte{0x47, 0x01, 0x20, 0x00, 1, 0, 0, 0}, 0, "failed to decode"},
+		{"unknown size", []byte{0x42, 0x01, 0x20, 0x00, 1, 0, 0, 0}, 0, "unknown or inconsistent SDO size"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			core, observed := observer.New(zapcore.WarnLevel)
+			s := New(Config{
+				InterfaceName: "can0",
+				Logger:        zap.New(core),
+				SDOObjects: []SDOObjectDef{{
+					NodeID: 1, Index: 0x2001,
+					Fields: []Field{{Name: "device.value", Type: codec.UintAuto, EmitLog: true}},
+				}},
+			})
+			logs := emit.NewLogsBuilder()
+			s.HandleFrame(cantransport.Frame{ID: 0x601, Data: []byte{0x40, 0x01, 0x20, 0x00, 0, 0, 0, 0}}, nil, logs)
+			s.HandleFrame(cantransport.Frame{ID: 0x581, Data: tc.reply}, nil, logs)
+			if tc.wantErr != "" {
+				assert.True(t, logs.Empty())
+				require.Equal(t, 1, observed.Len())
+				assert.Contains(t, observed.All()[0].Message, tc.wantErr)
+				return
+			}
+			require.False(t, logs.Empty())
+			records := logs.Emit().ResourceLogs().At(0).ScopeLogs().At(0).LogRecords()
+			require.Equal(t, 1, records.Len())
+			assert.Equal(t, tc.want, records.At(0).Body().Double())
+			assert.Equal(t, 0, observed.Len())
+		})
+	}
+}
+
+func TestSniffer_SDOUintAutoRejectsSegmentedSizeMismatch(t *testing.T) {
+	core, observed := observer.New(zapcore.WarnLevel)
+	s := New(Config{
+		InterfaceName: "can0",
+		Logger:        zap.New(core),
+		SDOObjects: []SDOObjectDef{{
+			NodeID: 1, Index: 0x2001,
+			Fields: []Field{{Name: "device.value", Type: codec.UintAuto, EmitLog: true}},
+		}},
+	})
+	logs := emit.NewLogsBuilder()
+	s.HandleFrame(cantransport.Frame{ID: 0x601, Data: []byte{0x40, 0x01, 0x20, 0x00, 0, 0, 0, 0}}, nil, logs)
+	s.HandleFrame(cantransport.Frame{ID: 0x581, Data: []byte{0x41, 0x01, 0x20, 0x00, 1, 0, 0, 0}}, nil, logs)
+	s.HandleFrame(cantransport.Frame{ID: 0x581, Data: []byte{0x0B, 0x34, 0x12, 0, 0, 0, 0, 0}}, nil, logs)
+	assert.True(t, logs.Empty())
+	require.Equal(t, 1, observed.Len())
+	assert.Contains(t, observed.All()[0].Message, "unknown or inconsistent SDO size")
 }
 
 func TestSniffer_UnknownCobID_Ignored(t *testing.T) {

@@ -2,7 +2,10 @@
 // It never sends frames or changes state on the CAN bus.
 package sdoobserver
 
-import "fmt"
+import (
+	"encoding/binary"
+	"fmt"
+)
 
 // Direction identifies the direction of an SDO frame.
 type Direction string
@@ -21,7 +24,11 @@ type Event struct {
 	Index     uint16
 	SubIndex  uint8
 	Data      []byte
-	AbortCode *uint32
+	// SizeUnknown marks expedited transfers whose command does not indicate
+	// how many of the four data bytes are valid.
+	SizeUnknown  bool
+	SizeMismatch bool
+	AbortCode    *uint32
 }
 
 type transfer struct {
@@ -31,6 +38,8 @@ type transfer struct {
 	index           uint16
 	subIndex        uint8
 	uploadInitiated bool
+	sizeIndicated   bool
+	indicatedSize   uint32
 	toggle          bool
 	data            []byte
 }
@@ -93,9 +102,13 @@ func (o *Observer) observeClient(channelKey uint32, nodeID uint8, command byte, 
 		index, subIndex := objectAddress(frame)
 		if command&0x02 != 0 {
 			data := expeditedData(command, frame)
-			return &Event{NodeID: nodeID, Direction: ClientToServer, Operation: "download", Index: index, SubIndex: subIndex, Data: data}, nil
+			return &Event{NodeID: nodeID, Direction: ClientToServer, Operation: "download", Index: index, SubIndex: subIndex, Data: data, SizeUnknown: command&0x01 == 0}, nil
 		}
-		o.transfers[channelKey] = &transfer{nodeID: nodeID, direction: ClientToServer, operation: "download", index: index, subIndex: subIndex}
+		o.transfers[channelKey] = &transfer{
+			nodeID: nodeID, direction: ClientToServer, operation: "download",
+			index: index, subIndex: subIndex, sizeIndicated: command&0x01 != 0,
+			indicatedSize: binary.LittleEndian.Uint32(frame[4:8]),
+		}
 		return nil, nil
 	}
 	if command&0xE0 != 0 {
@@ -117,9 +130,13 @@ func (o *Observer) observeServer(channelKey uint32, nodeID uint8, command byte, 
 		if command&0x02 != 0 {
 			data := expeditedData(command, frame)
 			delete(o.transfers, channelKey)
-			return complete(transfer, data), nil
+			event := complete(transfer, data)
+			event.SizeUnknown = command&0x01 == 0
+			return event, nil
 		}
 		transfer.uploadInitiated = true
+		transfer.sizeIndicated = command&0x01 != 0
+		transfer.indicatedSize = binary.LittleEndian.Uint32(frame[4:8])
 		return nil, nil
 	}
 	if transfer.operation == "download" && command == 0x60 {
@@ -174,6 +191,7 @@ func complete(transfer *transfer, data []byte) *Event {
 	return &Event{
 		NodeID: transfer.nodeID, Direction: transfer.direction,
 		Operation: transfer.operation, Index: transfer.index, SubIndex: transfer.subIndex,
-		Data: append([]byte(nil), data...),
+		Data:         append([]byte(nil), data...),
+		SizeMismatch: transfer.sizeIndicated && uint64(transfer.indicatedSize) != uint64(len(data)),
 	}
 }

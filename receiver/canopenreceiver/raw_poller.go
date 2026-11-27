@@ -205,6 +205,10 @@ func (r *canopenReceiver) emitRawTransaction(transaction RawTransactionConfig, f
 	for _, field := range transaction.Response.Fields {
 		value, err := codec.Decode(frame.Data, field.Type, field.BitOffset, field.ByteLen)
 		if err != nil {
+			if field.Type == codec.UintAuto {
+				r.settings.Logger.Warn("canopen: failed to decode uint_auto",
+					zap.String("transaction", transaction.Name), zap.String("field", field.Name), zap.Error(err))
+			}
 			continue
 		}
 		if field.Metrics && r.metricsIfEnabled() != nil {

@@ -53,7 +53,9 @@ func newCanopenReceiver(cfg *Config, set receiver.Settings, dialer cantransport.
 		metricsBuilder: emit.NewMetricsBuilder(),
 		logsBuilder:    emit.NewLogsBuilder(),
 	}
-	r.sniff = sniffer.New(buildSnifferConfig(cfg))
+	snifferConfig := buildSnifferConfig(cfg)
+	snifferConfig.Logger = set.Logger
+	r.sniff = sniffer.New(snifferConfig)
 	return r
 }
 

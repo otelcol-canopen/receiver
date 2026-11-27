@@ -167,7 +167,7 @@ func TestReceiver_SDOUploadPollOnce(t *testing.T) {
 		Timeout: time.Second,
 		Objects: []SDOObjectConfig{{
 			NodeID: 1, Index: 0x2001, SubIndex: 0,
-			Fields: []FieldConfig{{Name: "device.value", Type: codec.Uint16, Logs: true}},
+			Fields: []FieldConfig{{Name: "device.value", Type: codec.UintAuto, Logs: true}},
 		}},
 	}
 	require.NoError(t, cfg.Validate())
@@ -207,7 +207,7 @@ func TestReceiver_SDOUploadPollSegmented(t *testing.T) {
 		Timeout: time.Second,
 		Objects: []SDOObjectConfig{{
 			NodeID: 1, Index: 0x2001, SubIndex: 0,
-			Fields: []FieldConfig{{Name: "device.text", Type: codec.VisibleString, ByteLen: 11, Logs: true}},
+			Fields: []FieldConfig{{Name: "device.text", Type: codec.VisibleString, Logs: true}},
 		}},
 	}
 	require.NoError(t, cfg.Validate())
@@ -424,6 +424,32 @@ func waitForFrameData(t *testing.T, ctx context.Context, conn cantransport.Conn,
 
 func intPointer(value int) *int {
 	return &value
+}
+
+func TestReceiver_RawTransactionVariableLengthFields(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	cfg.Interface = "vcan0"
+	cfg.Logs.Enabled = true
+	r := newCanopenReceiver(cfg, receivertest.NewNopSettings(metadata.Type), nil)
+	for _, tc := range []struct {
+		kind codec.DataType
+		want string
+	}{
+		{codec.VisibleString, "v1.2"},
+		{codec.Bytes, "76312E32"},
+	} {
+		transaction := RawTransactionConfig{
+			Name: "version",
+			Response: RawResponseConfig{Fields: []FieldConfig{{
+				Name: "device.version", BitOffset: 8, Type: tc.kind, Logs: true,
+			}}},
+		}
+		r.emitRawTransaction(transaction, cantransport.Frame{ID: 0x501, Data: []byte{1, 'v', '1', '.', '2'}})
+		require.False(t, r.logsBuilder.Empty())
+		records := r.logsBuilder.Emit().ResourceLogs().At(0).ScopeLogs().At(0).LogRecords()
+		require.Equal(t, 1, records.Len())
+		assert.Equal(t, tc.want, records.At(0).Body().Str())
+	}
 }
 
 func TestReceiver_RawTransactionPoll(t *testing.T) {
