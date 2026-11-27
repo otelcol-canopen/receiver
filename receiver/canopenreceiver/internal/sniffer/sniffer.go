@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.uber.org/zap"
 
 	"github.com/otelcol-canopen/receiver/receiver/canopenreceiver/internal/cantransport"
 	"github.com/otelcol-canopen/receiver/receiver/canopenreceiver/internal/codec"
@@ -127,6 +128,7 @@ func (d RawMessageDef) matches(data []byte) bool {
 // expressed in terms independent of the top-level config package.
 type Config struct {
 	InterfaceName       string
+	Logger              *zap.Logger
 	PDOs                map[uint32]PDODef // keyed by CobID
 	HeartbeatEmitMetric bool
 	HeartbeatEmitLog    bool
@@ -173,6 +175,9 @@ type sdoKey struct {
 
 // New creates a Sniffer for the given configuration.
 func New(cfg Config) *Sniffer {
+	if cfg.Logger == nil {
+		cfg.Logger = zap.L()
+	}
 	s := &Sniffer{
 		cfg:        cfg,
 		nmtState:   make(map[uint8]NMTState),
@@ -302,7 +307,7 @@ func (s *Sniffer) handleRaw(f cantransport.Frame, metrics *emit.MetricsBuilder, 
 // the body; multiple logged fields use one map body keyed by field name.
 // contextAttrs/body identify the source (a PDO, raw message, or SDO object)
 // and are added once.
-func (s *Sniffer) emitFields(fields []Field, data []byte, resourceAttrs map[string]string, contextAttrs map[string]any, body string, metrics *emit.MetricsBuilder, logs *emit.LogsBuilder) {
+func (s *Sniffer) emitFields(fields []Field, data []byte, sizeInvalid bool, resourceAttrs map[string]string, contextAttrs map[string]any, body string, metrics *emit.MetricsBuilder, logs *emit.LogsBuilder) {
 	bodyMap := make(map[string]any, len(fields))
 	logAttrs := make(map[string]any, len(contextAttrs))
 	for k, v := range contextAttrs {
@@ -310,9 +315,18 @@ func (s *Sniffer) emitFields(fields []Field, data []byte, resourceAttrs map[stri
 	}
 	haveLog := false
 	for _, field := range fields {
+		if field.Type == codec.UintAuto && sizeInvalid {
+			s.cfg.Logger.Warn("canopen: cannot decode uint_auto with unknown or inconsistent SDO size",
+				zap.String("field", field.Name), zap.Any("context", contextAttrs))
+			continue
+		}
 		v, err := codec.Decode(data, field.Type, field.BitOffset, field.ByteLen)
 		if err != nil {
-			continue // malformed/short frame for this field; skip silently
+			if field.Type == codec.UintAuto {
+				s.cfg.Logger.Warn("canopen: failed to decode uint_auto",
+					zap.String("field", field.Name), zap.Any("context", contextAttrs), zap.Error(err))
+			}
+			continue
 		}
 		if field.EmitMetric && metrics != nil {
 			kind := emit.KindGauge
@@ -360,7 +374,7 @@ func (s *Sniffer) emitFields(fields []Field, data []byte, resourceAttrs map[stri
 func (s *Sniffer) handleRawMessage(msg RawMessageDef, f cantransport.Frame, metrics *emit.MetricsBuilder, logs *emit.LogsBuilder) {
 	attrs := s.resourceAttrs()
 	attrs["canopen.cob_id"] = fmt.Sprintf("0x%03X", f.ID)
-	s.emitFields(msg.Fields, f.Data, attrs,
+	s.emitFields(msg.Fields, f.Data, false, attrs,
 		map[string]any{"canopen.raw.message": msg.Name},
 		fmt.Sprintf("canopen raw message %s decoded", msg.Name),
 		metrics, logs)
@@ -368,7 +382,7 @@ func (s *Sniffer) handleRawMessage(msg RawMessageDef, f cantransport.Frame, metr
 
 func (s *Sniffer) handlePDO(pdo PDODef, f cantransport.Frame, metrics *emit.MetricsBuilder, logs *emit.LogsBuilder) {
 	attrs := s.resourceAttrs()
-	s.emitFields(pdo.Fields, f.Data, attrs,
+	s.emitFields(pdo.Fields, f.Data, false, attrs,
 		map[string]any{"canopen.pdo.name": pdo.Name},
 		fmt.Sprintf("canopen pdo %s decoded", pdo.Name),
 		metrics, logs)
@@ -513,5 +527,5 @@ func (s *Sniffer) emitTypedSDO(event sdoobserver.Event, metrics *emit.MetricsBui
 		"canopen.sdo.operation": event.Operation,
 	}
 	body := fmt.Sprintf("canopen SDO object 0x%04X:%02X decoded", event.Index, event.SubIndex)
-	s.emitFields(object.Fields, event.Data, attrs, contextAttrs, body, metrics, logs)
+	s.emitFields(object.Fields, event.Data, event.SizeUnknown || event.SizeMismatch, attrs, contextAttrs, body, metrics, logs)
 }

@@ -57,7 +57,8 @@ type FieldConfig struct {
 	Type codec.DataType `mapstructure:"type"`
 
 	// ByteLen is the number of bytes to read for Type == bytes or
-	// visible_string. Ignored for fixed-width numeric types.
+	// visible_string. Zero reads the remaining payload. Ignored for
+	// fixed-width numeric types.
 	ByteLen int `mapstructure:"byte_len"`
 
 	// Scale and Offset apply a linear transform (value*Scale + Offset) to
@@ -93,9 +94,17 @@ func (s *FieldConfig) validate(scope string) error {
 	if !s.Type.Valid() {
 		return fmt.Errorf("%s %q: unsupported type %q", scope, s.Name, s.Type)
 	}
+	if s.Type == codec.UintAuto {
+		if s.BitOffset%8 != 0 {
+			return fmt.Errorf("%s %q: bit_offset must be byte-aligned for uint_auto", scope, s.Name)
+		}
+		if s.ByteLen != 0 {
+			return fmt.Errorf("%s %q: byte_len must be omitted for uint_auto", scope, s.Name)
+		}
+	}
 	if s.Type == codec.Bytes || s.Type == codec.VisibleString {
-		if s.ByteLen <= 0 {
-			return fmt.Errorf("%s %q: byte_len must be > 0 for type %q", scope, s.Name, s.Type)
+		if s.ByteLen < 0 {
+			return fmt.Errorf("%s %q: byte_len must be >= 0 for type %q", scope, s.Name, s.Type)
 		}
 		if s.BitOffset%8 != 0 {
 			return fmt.Errorf("%s %q: bit_offset must be byte-aligned for type %q", scope, s.Name, s.Type)

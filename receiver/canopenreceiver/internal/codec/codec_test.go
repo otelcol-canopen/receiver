@@ -41,6 +41,35 @@ func TestDecode_NegativeInt(t *testing.T) {
 	assert.Equal(t, int64(-1), v.Int)
 }
 
+func TestDecode_UintAuto(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data []byte
+		want uint64
+	}{
+		{"8-bit", []byte{0xFE}, 0xFE},
+		{"16-bit", []byte{0x34, 0x12}, 0x1234},
+		{"32-bit", []byte{0x78, 0x56, 0x34, 0x12}, 0x12345678},
+		{"64-bit", []byte{1, 0, 0, 0, 0, 0, 0, 0}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			value, err := Decode(tc.data, UintAuto, 0, 0)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, value.Uint)
+			assert.Equal(t, float64(tc.want), value.AsFloat())
+		})
+	}
+	value, err := Decode([]byte{0xFF, 0x34, 0x12}, UintAuto, 8, 0)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0x1234), value.Uint)
+	for _, data := range [][]byte{nil, {1, 2, 3}, {1, 0, 0, 0, 0, 0, 0x20, 0}} {
+		_, err = Decode(data, UintAuto, 0, 0)
+		require.Error(t, err)
+	}
+	_, err = Decode([]byte{1}, UintAuto, 1, 0)
+	require.Error(t, err)
+}
+
 func TestDecode_Float32(t *testing.T) {
 	// 1.5f = 0x3FC00000 little-endian: 00 00 C0 3F
 	data := []byte{0x00, 0x00, 0xC0, 0x3F}
@@ -82,6 +111,42 @@ func TestDecode_VisibleString(t *testing.T) {
 	v, err := Decode(data, VisibleString, 0, 2)
 	require.NoError(t, err)
 	assert.Equal(t, "hi", v.String)
+}
+
+func TestDecode_VisibleStringRemainingPayload(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		data      []byte
+		bitOffset int
+		want      string
+	}{
+		{"full", []byte("hello world"), 0, "hello world"},
+		{"offset", []byte("xhello"), 8, "hello"},
+		{"empty", []byte{}, 0, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := Decode(tc.data, VisibleString, tc.bitOffset, 0)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, v.String)
+		})
+	}
+	_, err := Decode([]byte("hi"), VisibleString, 24, 0)
+	require.Error(t, err)
+	_, err = Decode([]byte("hi"), VisibleString, 0, -1)
+	require.Error(t, err)
+}
+
+func TestDecode_BytesRemainingPayload(t *testing.T) {
+	value, err := Decode([]byte{1, 2, 3}, Bytes, 8, 0)
+	require.NoError(t, err)
+	assert.Equal(t, []byte{2, 3}, value.Bytes)
+
+	value, err = Decode(nil, Bytes, 0, 0)
+	require.NoError(t, err)
+	assert.Empty(t, value.Bytes)
+
+	_, err = Decode([]byte{1}, Bytes, 0, -1)
+	require.Error(t, err)
 }
 
 func TestDecode_Truncated(t *testing.T) {

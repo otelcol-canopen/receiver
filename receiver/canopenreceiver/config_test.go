@@ -228,6 +228,54 @@ func TestConfig_Validate_FieldLogsOnlyOKForVisibleString(t *testing.T) {
 	require.NoError(t, cfg.Validate())
 }
 
+func TestConfig_Validate_VariableLengthFields(t *testing.T) {
+	cfg := validBaseConfig()
+	object := SDOObjectConfig{
+		NodeID: 1, Index: 0x100A,
+		Fields: []FieldConfig{{Name: "version", Type: codec.VisibleString, Logs: true}},
+	}
+	cfg.SDO.Sniff.Objects = []SDOObjectConfig{object}
+	cfg.SDO.Poll.Objects = []SDOObjectConfig{object}
+	cfg.SDO.Sniff.Objects = append(cfg.SDO.Sniff.Objects, SDOObjectConfig{
+		NodeID: 1, Index: 0x100B,
+		Fields: []FieldConfig{{Name: "payload", Type: codec.Bytes, Logs: true}},
+	})
+	cfg.PDO[0].Fields = []FieldConfig{{Name: "version", Type: codec.VisibleString, Logs: true}}
+	cfg.Raw.Sniff.Messages = []RawMessageConfig{{
+		Name: "version", CobID: 0x500,
+		Fields: []FieldConfig{{Name: "version", Type: codec.VisibleString, Logs: true}},
+	}}
+	cfg.Raw.Transactions = []RawTransactionConfig{{
+		Name: "version", CobID: 0x510, Payload: []byte{1}, Timeout: time.Second,
+		Response: RawResponseConfig{
+			CobID: 0x590, Match: []RawMatchByte{{ByteOffset: 0, Value: 1}},
+			Fields: []FieldConfig{{Name: "version", Type: codec.VisibleString, Logs: true}},
+		},
+	}}
+	require.NoError(t, cfg.Validate())
+
+	cfg.SDO.Sniff.Objects[0].Fields[0].ByteLen = -1
+	require.ErrorContains(t, cfg.Validate(), "byte_len must be >= 0")
+
+	cfg = validBaseConfig()
+	cfg.PDO[0].Fields = []FieldConfig{{Name: "version", Type: codec.Bytes, Logs: true}}
+	require.NoError(t, cfg.Validate())
+	cfg.PDO[0].Fields[0].ByteLen = -1
+	require.ErrorContains(t, cfg.Validate(), "byte_len must be >= 0")
+}
+
+func TestConfig_Validate_UintAuto(t *testing.T) {
+	cfg := validBaseConfig()
+	field := &cfg.PDO[0].Fields[0]
+	*field = FieldConfig{Name: "extension", Type: codec.UintAuto, Logs: true}
+	require.NoError(t, cfg.Validate())
+	field.BitOffset = 1
+	require.ErrorContains(t, cfg.Validate(), "byte-aligned")
+	field.BitOffset = 0
+	field.ByteLen = 1
+	require.ErrorContains(t, cfg.Validate(), "byte_len")
+}
+
 func TestConfig_Validate_SDOPollRejectsUnknownMode(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.SDO.Poll = SDOPollConfig{
